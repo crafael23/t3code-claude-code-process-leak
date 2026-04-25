@@ -39,6 +39,7 @@ import { ProjectionPendingApprovalRepository } from "../src/persistence/Services
 import { ProviderUnsupportedError } from "../src/provider/Errors.ts";
 import { ProviderAdapterRegistry } from "../src/provider/Services/ProviderAdapterRegistry.ts";
 import { ProviderSessionDirectoryLive } from "../src/provider/Layers/ProviderSessionDirectory.ts";
+import { ProviderSessionDirectoryEventsLive } from "../src/provider/Layers/ProviderSessionDirectoryEvents.ts";
 import { ServerSettingsService } from "../src/serverSettings.ts";
 import { makeProviderServiceLive } from "../src/provider/Layers/ProviderService.ts";
 import { makeCodexAdapterLive } from "../src/provider/Layers/CodexAdapter.ts";
@@ -258,8 +259,10 @@ export const makeOrchestrationIntegrationHarness = (
       Layer.provide(OrchestrationEventStoreLive),
       Layer.provide(OrchestrationCommandReceiptRepositoryLive),
     );
+    const providerSessionDirectoryEventsLayer = ProviderSessionDirectoryEventsLive;
     const providerSessionDirectoryLayer = ProviderSessionDirectoryLive.pipe(
       Layer.provide(ProviderSessionRuntimeRepositoryLive),
+      Layer.provide(providerSessionDirectoryEventsLayer),
     );
     const realCodexRegistry = Layer.effect(
       ProviderAdapterRegistry,
@@ -277,16 +280,19 @@ export const makeOrchestrationIntegrationHarness = (
       Layer.provide(makeCodexAdapterLive()),
       Layer.provideMerge(ServerConfig.layerTest(workspaceDir, rootDir)),
       Layer.provideMerge(NodeServices.layer),
+      Layer.provideMerge(providerSessionDirectoryEventsLayer),
       Layer.provideMerge(providerSessionDirectoryLayer),
     );
     const providerLayer = useRealCodex
       ? makeProviderServiceLive().pipe(
           Layer.provide(providerSessionDirectoryLayer),
+          Layer.provide(providerSessionDirectoryEventsLayer),
           Layer.provide(realCodexRegistry),
           Layer.provide(AnalyticsService.layerTest),
         )
       : makeProviderServiceLive().pipe(
           Layer.provide(providerSessionDirectoryLayer),
+          Layer.provide(providerSessionDirectoryEventsLayer),
           Layer.provide(fakeRegistry!),
           Layer.provide(AnalyticsService.layerTest),
         );

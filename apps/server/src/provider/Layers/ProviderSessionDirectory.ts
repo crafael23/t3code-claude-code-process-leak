@@ -10,6 +10,7 @@ import {
   type ProviderRuntimeBindingWithMetadata,
   type ProviderSessionDirectoryShape,
 } from "../Services/ProviderSessionDirectory.ts";
+import { ProviderSessionDirectoryEvents } from "../Services/ProviderSessionDirectoryEvents.ts";
 
 function toPersistenceError(operation: string) {
   return (cause: unknown) =>
@@ -76,6 +77,7 @@ function toRuntimeBinding(
 
 const makeProviderSessionDirectory = Effect.gen(function* () {
   const repository = yield* ProviderSessionRuntimeRepository;
+  const directoryEvents = yield* ProviderSessionDirectoryEvents;
 
   const getBinding = (threadId: ThreadId) =>
     repository.getByThreadId({ threadId }).pipe(
@@ -128,6 +130,14 @@ const makeProviderSessionDirectory = Effect.gen(function* () {
         ),
       })
       .pipe(Effect.mapError(toPersistenceError("ProviderSessionDirectory.upsert:upsert")));
+    yield* directoryEvents.publishChanged(resolvedThreadId).pipe(
+      Effect.catchCause((cause) =>
+        Effect.logDebug("provider.session.directory.change-signal-failed", {
+          threadId: resolvedThreadId,
+          cause,
+        }),
+      ),
+    );
   });
 
   const getProvider: ProviderSessionDirectoryShape["getProvider"] = (threadId) =>

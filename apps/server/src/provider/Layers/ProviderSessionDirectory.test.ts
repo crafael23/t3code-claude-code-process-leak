@@ -6,7 +6,7 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import { ThreadId } from "@t3tools/contracts";
 import { it, assert } from "@effect/vitest";
 import { assertSome } from "@effect/vitest/utils";
-import { Effect, Layer, Option } from "effect";
+import { Effect, Fiber, Layer, Option, Stream } from "effect";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 
 import {
@@ -16,15 +16,22 @@ import {
 import { ProviderSessionRuntimeRepositoryLive } from "../../persistence/Layers/ProviderSessionRuntime.ts";
 import { ProviderSessionRuntimeRepository } from "../../persistence/Services/ProviderSessionRuntime.ts";
 import { ProviderSessionDirectory } from "../Services/ProviderSessionDirectory.ts";
+import { ProviderSessionDirectoryEvents } from "../Services/ProviderSessionDirectoryEvents.ts";
+import { ProviderSessionDirectoryEventsLive } from "./ProviderSessionDirectoryEvents.ts";
 import { ProviderSessionDirectoryLive } from "./ProviderSessionDirectory.ts";
 
 function makeDirectoryLayer<E, R>(persistenceLayer: Layer.Layer<SqlClient.SqlClient, E, R>) {
   const runtimeRepositoryLayer = ProviderSessionRuntimeRepositoryLive.pipe(
     Layer.provide(persistenceLayer),
   );
+  const directoryEventsLayer = ProviderSessionDirectoryEventsLive;
   return Layer.mergeAll(
     runtimeRepositoryLayer,
-    ProviderSessionDirectoryLive.pipe(Layer.provide(runtimeRepositoryLayer)),
+    directoryEventsLayer,
+    ProviderSessionDirectoryLive.pipe(
+      Layer.provide(runtimeRepositoryLayer),
+      Layer.provide(directoryEventsLayer),
+    ),
     NodeServices.layer,
   );
 }
@@ -75,6 +82,26 @@ it.layer(makeDirectoryLayer(SqlitePersistenceMemory))("ProviderSessionDirectoryL
 
       const threadIds = yield* directory.listThreadIds();
       assert.deepEqual(threadIds, [nextThreadId]);
+    }));
+
+  it("publishes change notifications after successful upserts", () =>
+    Effect.gen(function* () {
+      const directory = yield* ProviderSessionDirectory;
+      const directoryEvents = yield* ProviderSessionDirectoryEvents;
+      const threadId = ThreadId.make("thread-change-notification");
+
+      const changeFiber = yield* Stream.take(directoryEvents.changes, 1).pipe(
+        Stream.runCollect,
+        Effect.forkScoped,
+      );
+      yield* Effect.yieldNow;
+      yield* directory.upsert({
+        provider: "codex",
+        threadId,
+      });
+
+      const changes = yield* Fiber.join(changeFiber);
+      assert.deepEqual(Array.from(changes), [{ threadId }]);
     }));
 
   it("persists runtime fields and merges payload updates", () =>
@@ -264,5 +291,45 @@ it.layer(makeDirectoryLayer(SqlitePersistenceMemory))("ProviderSessionDirectoryL
       }).pipe(Effect.provide(directoryLayer));
 
       fs.rmSync(tempDir, { recursive: true, force: true });
+    }));
+
+  it("persists bindings even when change notification publishing fails", () =>
+    Effect.gen(function* () {
+      const runtimeRepositoryLayer = ProviderSessionRuntimeRepositoryLive.pipe(
+        Layer.provide(SqlitePersistenceMemory),
+      );
+      const failingDirectoryEventsLayer = Layer.succeed(ProviderSessionDirectoryEvents, {
+        publishChanged: () => Effect.die(new Error("simulated publish failure")),
+        changes: Stream.empty,
+      });
+      const directoryLayer = Layer.mergeAll(
+        runtimeRepositoryLayer,
+        failingDirectoryEventsLayer,
+        ProviderSessionDirectoryLive.pipe(
+          Layer.provide(runtimeRepositoryLayer),
+          Layer.provide(failingDirectoryEventsLayer),
+        ),
+        NodeServices.layer,
+      );
+
+      const threadId = ThreadId.make("thread-failing-directory-events");
+      const runtime = yield* Effect.gen(function* () {
+        const directory = yield* ProviderSessionDirectory;
+        const repository = yield* ProviderSessionRuntimeRepository;
+
+        yield* directory.upsert({
+          provider: "codex",
+          threadId,
+          status: "running",
+        });
+
+        return yield* repository.getByThreadId({ threadId });
+      }).pipe(Effect.provide(directoryLayer));
+
+      assert.equal(Option.isSome(runtime), true);
+      if (Option.isSome(runtime)) {
+        assert.equal(runtime.value.threadId, threadId);
+        assert.equal(runtime.value.providerName, "codex");
+      }
     }));
 });

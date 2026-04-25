@@ -8,6 +8,7 @@ import { Effect, FileSystem, Layer, Path, Queue, Stream } from "effect";
 import { ProviderUnsupportedError } from "../src/provider/Errors.ts";
 import { ProviderAdapterRegistry } from "../src/provider/Services/ProviderAdapterRegistry.ts";
 import { ProviderSessionDirectoryLive } from "../src/provider/Layers/ProviderSessionDirectory.ts";
+import { ProviderSessionDirectoryEventsLive } from "../src/provider/Layers/ProviderSessionDirectoryEvents.ts";
 import { makeProviderServiceLive } from "../src/provider/Layers/ProviderService.ts";
 import {
   ProviderService,
@@ -55,12 +56,15 @@ const makeIntegrationFixture = Effect.gen(function* () {
     listProviders: () => Effect.succeed(["codex"]),
   };
 
+  const directoryEventsLayer = ProviderSessionDirectoryEventsLive;
   const directoryLayer = ProviderSessionDirectoryLive.pipe(
     Layer.provide(ProviderSessionRuntimeRepositoryLive),
+    Layer.provide(directoryEventsLayer),
   );
 
   const shared = Layer.mergeAll(
     directoryLayer,
+    directoryEventsLayer,
     Layer.succeed(ProviderAdapterRegistry, registry),
     ServerSettingsService.layerTest(DEFAULT_SERVER_SETTINGS),
     AnalyticsService.layerTest,

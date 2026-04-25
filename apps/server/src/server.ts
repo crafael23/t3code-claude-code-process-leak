@@ -18,6 +18,7 @@ import { ServerLifecycleEventsLive } from "./serverLifecycleEvents.ts";
 import { AnalyticsServiceLayerLive } from "./telemetry/Layers/AnalyticsService.ts";
 import { makeEventNdjsonLogger } from "./provider/Layers/EventNdjsonLogger.ts";
 import { ProviderSessionDirectoryLive } from "./provider/Layers/ProviderSessionDirectory.ts";
+import { ProviderSessionDirectoryEventsLive } from "./provider/Layers/ProviderSessionDirectoryEvents.ts";
 import { ProviderSessionRuntimeRepositoryLive } from "./persistence/Layers/ProviderSessionRuntime.ts";
 import { makeCodexAdapterLive } from "./provider/Layers/CodexAdapter.ts";
 import { makeClaudeAdapterLive } from "./provider/Layers/ClaudeAdapter.ts";
@@ -140,8 +141,11 @@ const CheckpointingLayerLive = Layer.empty.pipe(
   Layer.provideMerge(CheckpointStoreLive),
 );
 
+const ProviderSessionDirectoryEventsLayerLive = ProviderSessionDirectoryEventsLive;
+
 const ProviderSessionDirectoryLayerLive = ProviderSessionDirectoryLive.pipe(
   Layer.provide(ProviderSessionRuntimeRepositoryLive),
+  Layer.provide(ProviderSessionDirectoryEventsLayerLive),
 );
 
 const ProviderLayerLive = Layer.unwrap(
@@ -221,6 +225,7 @@ const AuthLayerLive = ServerAuthLive.pipe(
 
 const ProviderRuntimeLayerLive = ProviderSessionReaperLive.pipe(
   Layer.provideMerge(ProviderLayerLive),
+  Layer.provideMerge(ProviderSessionDirectoryEventsLayerLive),
   Layer.provideMerge(OrchestrationLayerLive),
 );
 

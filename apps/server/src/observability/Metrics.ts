@@ -54,6 +54,53 @@ export const providerRuntimeEventsTotal = Metric.counter("t3_provider_runtime_ev
   description: "Total canonical provider runtime events processed.",
 });
 
+export const providerSessionReaperWakeupsTotal = Metric.counter(
+  "t3_provider_session_reaper_wakeups_total",
+  {
+    description: "Total provider session reaper wakeups by mode and wake reason.",
+  },
+);
+
+export const providerSessionReaperDueCandidatesTotal = Metric.counter(
+  "t3_provider_session_reaper_due_candidates_total",
+  {
+    description: "Total provider session reaper due candidates evaluated.",
+  },
+);
+
+export const providerSessionReaperReapedTotal = Metric.counter(
+  "t3_provider_session_reaper_reaped_total",
+  {
+    description: "Total provider sessions reaped for inactivity.",
+  },
+);
+
+export const providerSessionReaperReapLag = Metric.timer("t3_provider_session_reaper_reap_lag", {
+  description: "Observed inactivity reap lag relative to the computed deadline.",
+});
+
+export const providerSessionReaperScheduleSize = Metric.gauge(
+  "t3_provider_session_reaper_schedule_size",
+  {
+    description: "Current number of future inactivity deadlines tracked by the reaper.",
+  },
+);
+
+export const providerSessionReaperReconcileDuration = Metric.timer(
+  "t3_provider_session_reaper_reconcile_duration",
+  {
+    description: "Provider session reaper authoritative reconcile duration.",
+  },
+);
+
+export const providerSessionReaperWakeCoalescedTotal = Metric.counter(
+  "t3_provider_session_reaper_wake_coalesced_total",
+  {
+    description:
+      "Total provider session reaper wake hints coalesced into an existing pending wake.",
+  },
+);
+
 export const gitCommandsTotal = Metric.counter("t3_git_commands_total", {
   description: "Total git commands executed by the server runtime.",
 });

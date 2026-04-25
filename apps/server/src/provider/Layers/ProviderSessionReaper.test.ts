@@ -1,6 +1,12 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
-import { ProjectId, ThreadId, TurnId } from "@t3tools/contracts";
-import { Effect, Exit, Layer, ManagedRuntime, Option, Scope, Stream } from "effect";
+import {
+  MessageId,
+  ProjectId,
+  ThreadId,
+  TurnId,
+  type OrchestrationEvent,
+} from "@t3tools/contracts";
+import { Effect, Exit, Layer, ManagedRuntime, Option, PubSub, Scope, Stream } from "effect";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
@@ -13,6 +19,7 @@ import { ProviderSessionRuntimeRepository } from "../../persistence/Services/Pro
 import { ProviderValidationError } from "../Errors.ts";
 import { ProviderSessionReaper } from "../Services/ProviderSessionReaper.ts";
 import { ProviderService, type ProviderServiceShape } from "../Services/ProviderService.ts";
+import { ProviderSessionDirectoryEventsLive } from "./ProviderSessionDirectoryEvents.ts";
 import { ProviderSessionDirectoryLive } from "./ProviderSessionDirectory.ts";
 import { makeProviderSessionReaperLive } from "./ProviderSessionReaper.ts";
 
@@ -45,10 +52,18 @@ const unsupported = () => Effect.die(new Error("Unsupported provider call in tes
 function makeReadModel(
   threads: ReadonlyArray<{
     readonly id: ThreadId;
+    readonly latestTurn?: {
+      readonly turnId: TurnId;
+      readonly state: "running" | "interrupted" | "completed" | "error";
+      readonly requestedAt: string;
+      readonly startedAt: string | null;
+      readonly completedAt: string | null;
+      readonly assistantMessageId: MessageId | null;
+    } | null;
     readonly session: {
       readonly threadId: ThreadId;
       readonly status: "starting" | "running" | "ready" | "interrupted" | "stopped" | "error";
-      readonly providerName: "codex" | "claudeAgent";
+      readonly providerName: "codex" | "claudeAgent" | "cursor" | "opencode";
       readonly runtimeMode: "approval-required" | "full-access" | "auto-accept-edits";
       readonly activeTurnId: TurnId | null;
       readonly lastError: string | null;
@@ -86,7 +101,7 @@ function makeReadModel(
       createdAt: now,
       updatedAt: now,
       archivedAt: null,
-      latestTurn: null,
+      latestTurn: thread.latestTurn ?? null,
       messages: [],
       session: thread.session,
       activities: [],
@@ -144,24 +159,32 @@ describe("ProviderSessionReaper", () => {
       streamEvents: Stream.empty,
     };
 
+    const domainEventPubSub = Effect.runSync(PubSub.unbounded<OrchestrationEvent>());
+    const currentReadModel = input.readModel;
     const orchestrationEngine: OrchestrationEngineShape = {
-      getReadModel: () => Effect.succeed(input.readModel),
+      getReadModel: () => Effect.succeed(currentReadModel),
       readEvents: () => Stream.empty,
       dispatch: () => unsupported(),
-      streamDomainEvents: Stream.empty,
+      get streamDomainEvents() {
+        return Stream.fromPubSub(domainEventPubSub);
+      },
     };
 
     const runtimeRepositoryLayer = ProviderSessionRuntimeRepositoryLive.pipe(
       Layer.provide(SqlitePersistenceMemory),
     );
+    const directoryEventsLayer = ProviderSessionDirectoryEventsLive;
     const providerSessionDirectoryLayer = ProviderSessionDirectoryLive.pipe(
       Layer.provide(runtimeRepositoryLayer),
+      Layer.provide(directoryEventsLayer),
     );
     const layer = makeProviderSessionReaperLive({
       inactivityThresholdMs: 1_000,
-      sweepIntervalMs: 60_000,
+      fallbackReconcileIntervalMs: 60_000,
+      mode: "deadline",
     }).pipe(
       Layer.provideMerge(providerSessionDirectoryLayer),
+      Layer.provideMerge(directoryEventsLayer),
       Layer.provideMerge(runtimeRepositoryLayer),
       Layer.provideMerge(Layer.succeed(ProviderService, providerService)),
       Layer.provideMerge(Layer.succeed(OrchestrationEngineService, orchestrationEngine)),
@@ -169,7 +192,10 @@ describe("ProviderSessionReaper", () => {
     );
 
     runtime = ManagedRuntime.make(layer);
-    return { stopSession, stoppedThreadIds };
+    return {
+      stopSession,
+      stoppedThreadIds,
+    };
   }
 
   it("reaps stale persisted sessions without active turns", async () => {
@@ -203,6 +229,116 @@ describe("ProviderSessionReaper", () => {
         lastSeenAt: "2026-04-14T00:00:00.000Z",
         resumeCursor: {
           opaque: "resume-stale",
+        },
+        runtimePayload: null,
+      }),
+    );
+
+    const reaper = await runtime!.runPromise(Effect.service(ProviderSessionReaper));
+    scope = await Effect.runPromise(Scope.make("sequential"));
+    await Effect.runPromise(reaper.start().pipe(Scope.provide(scope)));
+
+    await waitFor(() => harness.stopSession.mock.calls.length === 1);
+
+    expect(harness.stopSession.mock.calls[0]?.[0]).toEqual({ threadId });
+    expect(harness.stoppedThreadIds.has(threadId)).toBe(true);
+  });
+
+  it("does not reap when the latest turn is still within the inactivity threshold", async () => {
+    const threadId = ThreadId.make("thread-reaper-latest-turn-fresh");
+    const turnId = TurnId.make("turn-reaper-latest-fresh");
+    const now = new Date().toISOString();
+    const harness = await createHarness({
+      readModel: makeReadModel([
+        {
+          id: threadId,
+          latestTurn: {
+            turnId,
+            state: "completed",
+            requestedAt: now,
+            startedAt: now,
+            completedAt: now,
+            assistantMessageId: null,
+          },
+          session: {
+            threadId,
+            status: "ready",
+            providerName: "claudeAgent",
+            runtimeMode: "full-access",
+            activeTurnId: null,
+            lastError: null,
+            updatedAt: now,
+          },
+        },
+      ]),
+    });
+    const repository = await runtime!.runPromise(Effect.service(ProviderSessionRuntimeRepository));
+
+    await runtime!.runPromise(
+      repository.upsert({
+        threadId,
+        providerName: "claudeAgent",
+        adapterKey: "claudeAgent",
+        runtimeMode: "full-access",
+        status: "running",
+        lastSeenAt: "2026-04-14T00:00:00.000Z",
+        resumeCursor: {
+          opaque: "resume-latest-turn-fresh",
+        },
+        runtimePayload: null,
+      }),
+    );
+
+    const reaper = await runtime!.runPromise(Effect.service(ProviderSessionReaper));
+    scope = await Effect.runPromise(Scope.make("sequential"));
+    await Effect.runPromise(reaper.start().pipe(Scope.provide(scope)));
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    expect(harness.stopSession).not.toHaveBeenCalled();
+    const remaining = await runtime!.runPromise(repository.getByThreadId({ threadId }));
+    expect(Option.isSome(remaining)).toBe(true);
+  });
+
+  it("reaps based on the latest turn even when lastSeenAt is fresher", async () => {
+    const threadId = ThreadId.make("thread-reaper-latest-turn-stale");
+    const turnId = TurnId.make("turn-reaper-latest-stale");
+    const now = new Date().toISOString();
+    const harness = await createHarness({
+      readModel: makeReadModel([
+        {
+          id: threadId,
+          latestTurn: {
+            turnId,
+            state: "completed",
+            requestedAt: "2026-04-14T00:00:00.000Z",
+            startedAt: "2026-04-14T00:00:00.000Z",
+            completedAt: "2026-04-14T00:00:00.000Z",
+            assistantMessageId: null,
+          },
+          session: {
+            threadId,
+            status: "ready",
+            providerName: "claudeAgent",
+            runtimeMode: "full-access",
+            activeTurnId: null,
+            lastError: null,
+            updatedAt: now,
+          },
+        },
+      ]),
+    });
+    const repository = await runtime!.runPromise(Effect.service(ProviderSessionRuntimeRepository));
+
+    await runtime!.runPromise(
+      repository.upsert({
+        threadId,
+        providerName: "claudeAgent",
+        adapterKey: "claudeAgent",
+        runtimeMode: "full-access",
+        status: "running",
+        lastSeenAt: now,
+        resumeCursor: {
+          opaque: "resume-latest-turn-stale",
         },
         runtimePayload: null,
       }),

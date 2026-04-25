@@ -33,6 +33,7 @@ import { ProviderAdapterRegistry } from "../Services/ProviderAdapterRegistry.ts"
 import { ProviderService } from "../Services/ProviderService.ts";
 import { ProviderSessionDirectory } from "../Services/ProviderSessionDirectory.ts";
 import { makeProviderServiceLive } from "./ProviderService.ts";
+import { ProviderSessionDirectoryEventsLive } from "./ProviderSessionDirectoryEvents.ts";
 import { ProviderSessionDirectoryLive } from "./ProviderSessionDirectory.ts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { ProviderSessionRuntimeRepositoryLive } from "../../persistence/Layers/ProviderSessionRuntime.ts";
@@ -50,6 +51,19 @@ const asRequestId = (value: string): ApprovalRequestId => ApprovalRequestId.make
 const asEventId = (value: string): EventId => EventId.make(value);
 const asThreadId = (value: string): ThreadId => ThreadId.make(value);
 const asTurnId = (value: string): TurnId => TurnId.make(value);
+
+function makeDirectoryLayer<E, R>(
+  runtimeRepositoryLayer: Layer.Layer<ProviderSessionRuntimeRepository, E, R>,
+) {
+  const directoryEventsLayer = ProviderSessionDirectoryEventsLive;
+  return Layer.mergeAll(
+    directoryEventsLayer,
+    ProviderSessionDirectoryLive.pipe(
+      Layer.provide(runtimeRepositoryLayer),
+      Layer.provide(directoryEventsLayer),
+    ),
+  );
+}
 
 type LegacyProviderRuntimeEvent = {
   readonly type: string;
@@ -262,7 +276,7 @@ function makeProviderServiceLayer() {
   const runtimeRepositoryLayer = ProviderSessionRuntimeRepositoryLive.pipe(
     Layer.provide(SqlitePersistenceMemory),
   );
-  const directoryLayer = ProviderSessionDirectoryLive.pipe(Layer.provide(runtimeRepositoryLayer));
+  const directoryLayer = makeDirectoryLayer(runtimeRepositoryLayer);
 
   const layer = it.layer(
     Layer.mergeAll(
@@ -311,7 +325,7 @@ it.effect("ProviderServiceLive rejects new sessions for disabled providers", () 
     const runtimeRepositoryLayer = ProviderSessionRuntimeRepositoryLive.pipe(
       Layer.provide(SqlitePersistenceMemory),
     );
-    const directoryLayer = ProviderSessionDirectoryLive.pipe(Layer.provide(runtimeRepositoryLayer));
+    const directoryLayer = makeDirectoryLayer(runtimeRepositoryLayer);
     const providerLayer = makeProviderServiceLive().pipe(
       Layer.provide(providerAdapterLayer),
       Layer.provide(directoryLayer),
@@ -353,7 +367,7 @@ it.effect("ProviderServiceLive writes canonical events to the emitting thread se
     const runtimeRepositoryLayer = ProviderSessionRuntimeRepositoryLive.pipe(
       Layer.provide(SqlitePersistenceMemory),
     );
-    const directoryLayer = ProviderSessionDirectoryLive.pipe(Layer.provide(runtimeRepositoryLayer));
+    const directoryLayer = makeDirectoryLayer(runtimeRepositoryLayer);
     const providerLayer = makeProviderServiceLive({
       canonicalEventLogger: {
         filePath: "memory://provider-canonical-events",
@@ -411,7 +425,7 @@ it.effect("ProviderServiceLive keeps persisted resumable sessions on startup", (
     const runtimeRepositoryLayer = ProviderSessionRuntimeRepositoryLive.pipe(
       Layer.provide(persistenceLayer),
     );
-    const directoryLayer = ProviderSessionDirectoryLive.pipe(Layer.provide(runtimeRepositoryLayer));
+    const directoryLayer = makeDirectoryLayer(runtimeRepositoryLayer);
 
     yield* Effect.gen(function* () {
       const directory = yield* ProviderSessionDirectory;
@@ -478,9 +492,7 @@ it.effect(
         listProviders: () => Effect.succeed(["codex"]),
       };
 
-      const firstDirectoryLayer = ProviderSessionDirectoryLive.pipe(
-        Layer.provide(runtimeRepositoryLayer),
-      );
+      const firstDirectoryLayer = makeDirectoryLayer(runtimeRepositoryLayer);
       const firstProviderLayer = makeProviderServiceLive().pipe(
         Layer.provide(Layer.succeed(ProviderAdapterRegistry, firstRegistry)),
         Layer.provide(firstDirectoryLayer),
@@ -530,9 +542,7 @@ it.effect(
             : Effect.fail(new ProviderUnsupportedError({ provider })),
         listProviders: () => Effect.succeed(["codex"]),
       };
-      const secondDirectoryLayer = ProviderSessionDirectoryLive.pipe(
-        Layer.provide(runtimeRepositoryLayer),
-      );
+      const secondDirectoryLayer = makeDirectoryLayer(runtimeRepositoryLayer);
       const secondProviderLayer = makeProviderServiceLive().pipe(
         Layer.provide(Layer.succeed(ProviderAdapterRegistry, secondRegistry)),
         Layer.provide(secondDirectoryLayer),
@@ -990,9 +1000,7 @@ routing.layer("ProviderServiceLive routing", (it) => {
             : Effect.fail(new ProviderUnsupportedError({ provider })),
         listProviders: () => Effect.succeed(["claudeAgent"]),
       };
-      const firstDirectoryLayer = ProviderSessionDirectoryLive.pipe(
-        Layer.provide(runtimeRepositoryLayer),
-      );
+      const firstDirectoryLayer = makeDirectoryLayer(runtimeRepositoryLayer);
       const firstProviderLayer = makeProviderServiceLive().pipe(
         Layer.provide(Layer.succeed(ProviderAdapterRegistry, firstRegistry)),
         Layer.provide(firstDirectoryLayer),
@@ -1023,9 +1031,7 @@ routing.layer("ProviderServiceLive routing", (it) => {
             : Effect.fail(new ProviderUnsupportedError({ provider })),
         listProviders: () => Effect.succeed(["claudeAgent"]),
       };
-      const secondDirectoryLayer = ProviderSessionDirectoryLive.pipe(
-        Layer.provide(runtimeRepositoryLayer),
-      );
+      const secondDirectoryLayer = makeDirectoryLayer(runtimeRepositoryLayer);
       const secondProviderLayer = makeProviderServiceLive().pipe(
         Layer.provide(Layer.succeed(ProviderAdapterRegistry, secondRegistry)),
         Layer.provide(secondDirectoryLayer),
