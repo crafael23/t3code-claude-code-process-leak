@@ -19,6 +19,7 @@ import {
 import { SqlitePersistenceMemory } from "../../persistence/Layers/Sqlite.ts";
 import { ProviderSessionRuntimeRepositoryLive } from "../../persistence/Layers/ProviderSessionRuntime.ts";
 import { ProviderSessionRuntimeRepository } from "../../persistence/Services/ProviderSessionRuntime.ts";
+import { ProviderValidationError } from "../Errors.ts";
 import { ProviderSessionReaper } from "../Services/ProviderSessionReaper.ts";
 import { ProviderService, type ProviderServiceShape } from "../Services/ProviderService.ts";
 import { ProviderSessionDirectory } from "../Services/ProviderSessionDirectory.ts";
@@ -124,6 +125,7 @@ function makeHarness(input: {
   readonly initialReadModel: ReturnType<typeof makeReadModel>;
   readonly inactivityThresholdMs: number;
   readonly fallbackReconcileIntervalMs: number;
+  readonly stopFailureRetryIntervalMs?: number;
   readonly stopSessionImplementation?: (request: {
     readonly threadId: ThreadId;
   }) => ReturnType<ProviderServiceShape["stopSession"]>;
@@ -168,6 +170,9 @@ function makeHarness(input: {
     const layer = makeProviderSessionReaperLive({
       inactivityThresholdMs: input.inactivityThresholdMs,
       fallbackReconcileIntervalMs: input.fallbackReconcileIntervalMs,
+      ...(input.stopFailureRetryIntervalMs !== undefined
+        ? { stopFailureRetryIntervalMs: input.stopFailureRetryIntervalMs }
+        : {}),
     }).pipe(
       Layer.provideMerge(directoryLayer),
       Layer.provideMerge(directoryEventsLayer),
@@ -341,6 +346,133 @@ it.effect("reschedules future deadlines after a reap without relying on a direct
         assert.deepEqual(
           harness.stopSession.mock.calls.map(([request]) => request.threadId),
           [dueThreadId, futureThreadId],
+        );
+      }).pipe(Effect.provide(harness.layer));
+    }).pipe(Effect.provide(TestClock.layer())),
+  ),
+);
+
+it.effect("keeps future deadlines scheduled while retrying failed stops", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const failedThreadId = ThreadId.make("thread-stop-failure-retry");
+      const futureThreadId = ThreadId.make("thread-stop-failure-future");
+      const harness = yield* makeHarness({
+        initialReadModel: makeReadModel([
+          {
+            id: failedThreadId,
+            session: {
+              threadId: failedThreadId,
+              status: "ready",
+              providerName: "codex",
+              runtimeMode: "full-access",
+              activeTurnId: null,
+              lastError: null,
+              updatedAt: new Date(0).toISOString(),
+            },
+          },
+          {
+            id: futureThreadId,
+            session: {
+              threadId: futureThreadId,
+              status: "ready",
+              providerName: "claudeAgent",
+              runtimeMode: "full-access",
+              activeTurnId: null,
+              lastError: null,
+              updatedAt: new Date(300).toISOString(),
+            },
+          },
+        ]),
+        inactivityThresholdMs: 1_000,
+        fallbackReconcileIntervalMs: 60_000,
+        stopFailureRetryIntervalMs: 1_000,
+        stopSessionImplementation: (request) =>
+          request.threadId === failedThreadId
+            ? Effect.fail(
+                new ProviderValidationError({
+                  operation: "ProviderSessionReaper.timing.test",
+                  issue: "simulated stop failure",
+                }),
+              )
+            : (Effect.gen(function* () {
+                const repository = yield* ProviderSessionRuntimeRepository;
+                yield* repository.upsert({
+                  threadId: request.threadId,
+                  providerName: "claudeAgent",
+                  adapterKey: "claudeAgent",
+                  runtimeMode: "full-access",
+                  status: "stopped",
+                  lastSeenAt: new Date(300).toISOString(),
+                  resumeCursor: null,
+                  runtimePayload: {
+                    activeTurnId: null,
+                  },
+                });
+              }) as ReturnType<ProviderServiceShape["stopSession"]>),
+      });
+
+      yield* Effect.gen(function* () {
+        const repository = yield* ProviderSessionRuntimeRepository;
+        const reaper = yield* ProviderSessionReaper;
+
+        yield* repository.upsert({
+          threadId: failedThreadId,
+          providerName: "codex",
+          adapterKey: "codex",
+          runtimeMode: "full-access",
+          status: "running",
+          lastSeenAt: new Date(0).toISOString(),
+          resumeCursor: null,
+          runtimePayload: null,
+        });
+        yield* repository.upsert({
+          threadId: futureThreadId,
+          providerName: "claudeAgent",
+          adapterKey: "claudeAgent",
+          runtimeMode: "full-access",
+          status: "running",
+          lastSeenAt: new Date(300).toISOString(),
+          resumeCursor: null,
+          runtimePayload: null,
+        });
+
+        yield* reaper.start();
+        yield* Effect.yieldNow;
+
+        yield* TestClock.adjust(Duration.millis(1_001));
+        yield* Effect.yieldNow;
+        assert.deepEqual(
+          harness.stopSession.mock.calls.map(([request]) => request.threadId),
+          [failedThreadId],
+        );
+
+        yield* TestClock.adjust(Duration.millis(298));
+        yield* Effect.yieldNow;
+        assert.deepEqual(
+          harness.stopSession.mock.calls.map(([request]) => request.threadId),
+          [failedThreadId],
+        );
+
+        yield* TestClock.adjust(Duration.millis(2));
+        yield* Effect.yieldNow;
+        assert.deepEqual(
+          harness.stopSession.mock.calls.map(([request]) => request.threadId),
+          [failedThreadId, failedThreadId, futureThreadId],
+        );
+
+        yield* TestClock.adjust(Duration.millis(500));
+        yield* Effect.yieldNow;
+        assert.deepEqual(
+          harness.stopSession.mock.calls.map(([request]) => request.threadId),
+          [failedThreadId, failedThreadId, futureThreadId],
+        );
+
+        yield* TestClock.adjust(Duration.millis(600));
+        yield* Effect.yieldNow;
+        assert.deepEqual(
+          harness.stopSession.mock.calls.map(([request]) => request.threadId),
+          [failedThreadId, failedThreadId, futureThreadId, failedThreadId],
         );
       }).pipe(Effect.provide(harness.layer));
     }).pipe(Effect.provide(TestClock.layer())),

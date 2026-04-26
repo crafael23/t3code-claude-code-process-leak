@@ -18,6 +18,7 @@ import { ProviderSessionDirectoryEvents } from "../Services/ProviderSessionDirec
 import {
   DEFAULT_PROVIDER_SESSION_REAPER_FALLBACK_RECONCILE_INTERVAL_MS,
   DEFAULT_PROVIDER_SESSION_REAPER_INACTIVITY_THRESHOLD_MS,
+  DEFAULT_PROVIDER_SESSION_REAPER_STOP_FAILURE_RETRY_INTERVAL_MS,
   ProviderSessionReaper,
   type ProviderSessionReaperShape,
 } from "../Services/ProviderSessionReaper.ts";
@@ -30,6 +31,7 @@ const REAPER_MODE = "deadline";
 export interface ProviderSessionReaperLiveOptions {
   readonly inactivityThresholdMs?: number;
   readonly fallbackReconcileIntervalMs?: number;
+  readonly stopFailureRetryIntervalMs?: number;
 }
 
 type ReaperSignal =
@@ -166,6 +168,17 @@ function providerBreakdown(
   return counts;
 }
 
+function earliestDeadline(...deadlines: ReadonlyArray<number | undefined>): number | undefined {
+  let earliest: number | undefined = undefined;
+  for (const deadline of deadlines) {
+    if (deadline === undefined) {
+      continue;
+    }
+    earliest = earliest === undefined ? deadline : Math.min(earliest, deadline);
+  }
+  return earliest;
+}
+
 const makeCoalescedWake = () =>
   Effect.gen(function* () {
     const queue = yield* Effect.acquireRelease(Queue.dropping<ReaperSignal>(1), Queue.shutdown);
@@ -198,6 +211,11 @@ const makeProviderSessionReaper = (options?: ProviderSessionReaperLiveOptions) =
       1,
       options?.fallbackReconcileIntervalMs ??
         DEFAULT_PROVIDER_SESSION_REAPER_FALLBACK_RECONCILE_INTERVAL_MS,
+    );
+    const stopFailureRetryIntervalMs = Math.max(
+      1,
+      options?.stopFailureRetryIntervalMs ??
+        DEFAULT_PROVIDER_SESSION_REAPER_STOP_FAILURE_RETRY_INTERVAL_MS,
     );
     const mode = REAPER_MODE;
 
@@ -589,6 +607,36 @@ const makeProviderSessionReaper = (options?: ProviderSessionReaperLiveOptions) =
               "provider.session_reaper.reaped_count": stopResult.reapedCount,
               "provider.session_reaper.stop_failed_count": stopResult.stopFailedCount,
             });
+            if (stopResult.stopFailedCount > 0) {
+              const nextFutureDeadlineAtMs = futureEntries[0]?.deadlineAtMs;
+              const retryDeadlineAtMs = now + stopFailureRetryIntervalMs;
+              const nextDeadlineAtMs = earliestDeadline(retryDeadlineAtMs, nextFutureDeadlineAtMs);
+              yield* Effect.logDebug("provider.session.reaper.stop-failure-retry-scheduled", {
+                mode,
+                stopFailedCount: stopResult.stopFailedCount,
+                reapedCount: stopResult.reapedCount,
+                stopFailureRetryIntervalMs,
+                retryDeadlineAtMs,
+                retryDeadlineAt: new Date(retryDeadlineAtMs).toISOString(),
+                ...(nextFutureDeadlineAtMs !== undefined
+                  ? {
+                      nextFutureDeadlineAtMs,
+                      nextFutureDeadlineAt: new Date(nextFutureDeadlineAtMs).toISOString(),
+                    }
+                  : {}),
+                ...(nextDeadlineAtMs !== undefined
+                  ? {
+                      nextDeadlineAtMs,
+                      nextDeadlineAt: new Date(nextDeadlineAtMs).toISOString(),
+                      waitMs: Math.max(0, nextDeadlineAtMs - now),
+                    }
+                  : {}),
+              });
+              return {
+                nextDeadlineAtMs,
+                observedStartupWake: false,
+              };
+            }
             if (stopResult.reapedCount > 0 && futureEntries.length > 0) {
               yield* signalWake({ type: "reconcile-all", reason: "post-stop" });
             }
@@ -644,6 +692,7 @@ const makeProviderSessionReaper = (options?: ProviderSessionReaperLiveOptions) =
           mode,
           inactivityThresholdMs,
           fallbackReconcileIntervalMs,
+          stopFailureRetryIntervalMs,
         });
       }).pipe(
         Effect.withSpan("provider.session.reaper.start", {
@@ -651,6 +700,7 @@ const makeProviderSessionReaper = (options?: ProviderSessionReaperLiveOptions) =
             "provider.session_reaper.mode": mode,
             "provider.session_reaper.inactivity_threshold_ms": inactivityThresholdMs,
             "provider.session_reaper.fallback_reconcile_interval_ms": fallbackReconcileIntervalMs,
+            "provider.session_reaper.stop_failure_retry_interval_ms": stopFailureRetryIntervalMs,
           },
         }),
       );
