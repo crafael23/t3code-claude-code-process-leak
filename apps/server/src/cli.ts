@@ -57,6 +57,10 @@ import { OrchestrationEngineService } from "./orchestration/Services/Orchestrati
 import { ProjectionSnapshotQuery } from "./orchestration/Services/ProjectionSnapshotQuery.ts";
 import { OrchestrationLayerLive } from "./orchestration/runtimeLayer.ts";
 import { layerConfig as SqlitePersistenceLayerLive } from "./persistence/Layers/Sqlite.ts";
+import {
+  DEFAULT_PROVIDER_SESSION_REAPER_FALLBACK_RECONCILE_INTERVAL_MS,
+  DEFAULT_PROVIDER_SESSION_REAPER_INACTIVITY_THRESHOLD_MS,
+} from "./provider/Services/ProviderSessionReaper.ts";
 import { RepositoryIdentityResolverLive } from "./project/Layers/RepositoryIdentityResolver.ts";
 import { getAutoBootstrapDefaultModelSelection } from "./serverRuntimeStartup.ts";
 import {
@@ -150,6 +154,12 @@ const EnvServerConfig = Config.all({
     Config.withDefault(10_000),
   ),
   otlpServiceName: Config.string("T3CODE_OTLP_SERVICE_NAME").pipe(Config.withDefault("t3-server")),
+  providerSessionReaperInactivityThresholdMs: Config.int(
+    "T3CODE_PROVIDER_SESSION_REAPER_INACTIVITY_THRESHOLD_MS",
+  ).pipe(Config.withDefault(DEFAULT_PROVIDER_SESSION_REAPER_INACTIVITY_THRESHOLD_MS)),
+  providerSessionReaperFallbackReconcileIntervalMs: Config.int(
+    "T3CODE_PROVIDER_SESSION_REAPER_FALLBACK_RECONCILE_INTERVAL_MS",
+  ).pipe(Config.withDefault(DEFAULT_PROVIDER_SESSION_REAPER_FALLBACK_RECONCILE_INTERVAL_MS)),
   mode: Config.schema(RuntimeMode, "T3CODE_MODE").pipe(
     Config.option,
     Config.map(Option.getOrUndefined),
@@ -351,6 +361,9 @@ export const resolveServerConfig = (
         persistedObservabilitySettings.otlpMetricsUrl,
       otlpExportIntervalMs: env.otlpExportIntervalMs,
       otlpServiceName: env.otlpServiceName,
+      providerSessionReaperInactivityThresholdMs: env.providerSessionReaperInactivityThresholdMs,
+      providerSessionReaperFallbackReconcileIntervalMs:
+        env.providerSessionReaperFallbackReconcileIntervalMs,
       mode,
       port,
       cwd,

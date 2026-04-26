@@ -8,6 +8,11 @@
  */
 import { Effect, FileSystem, Layer, LogLevel, Path, Schema, Context } from "effect";
 
+import {
+  DEFAULT_PROVIDER_SESSION_REAPER_FALLBACK_RECONCILE_INTERVAL_MS,
+  DEFAULT_PROVIDER_SESSION_REAPER_INACTIVITY_THRESHOLD_MS,
+} from "./provider/Services/ProviderSessionReaper.ts";
+
 export const DEFAULT_PORT = 3773;
 
 export const RuntimeMode = Schema.Literals(["web", "desktop"]);
@@ -53,6 +58,8 @@ export interface ServerConfigShape extends ServerDerivedPaths {
   readonly otlpMetricsUrl: string | undefined;
   readonly otlpExportIntervalMs: number;
   readonly otlpServiceName: string;
+  readonly providerSessionReaperInactivityThresholdMs: number;
+  readonly providerSessionReaperFallbackReconcileIntervalMs: number;
   readonly mode: RuntimeMode;
   readonly port: number;
   readonly host: string | undefined;
@@ -152,6 +159,10 @@ export class ServerConfig extends Context.Service<ServerConfig, ServerConfigShap
           otlpMetricsUrl: undefined,
           otlpExportIntervalMs: 10_000,
           otlpServiceName: "t3-server",
+          providerSessionReaperInactivityThresholdMs:
+            DEFAULT_PROVIDER_SESSION_REAPER_INACTIVITY_THRESHOLD_MS,
+          providerSessionReaperFallbackReconcileIntervalMs:
+            DEFAULT_PROVIDER_SESSION_REAPER_FALLBACK_RECONCILE_INTERVAL_MS,
           cwd,
           baseDir,
           ...derivedPaths,

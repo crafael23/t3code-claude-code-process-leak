@@ -26,7 +26,7 @@ import { makeCursorAdapterLive } from "./provider/Layers/CursorAdapter.ts";
 import { makeOpenCodeAdapterLive } from "./provider/Layers/OpenCodeAdapter.ts";
 import { ProviderAdapterRegistryLive } from "./provider/Layers/ProviderAdapterRegistry.ts";
 import { makeProviderServiceLive } from "./provider/Layers/ProviderService.ts";
-import { ProviderSessionReaperLive } from "./provider/Layers/ProviderSessionReaper.ts";
+import { makeProviderSessionReaperLive } from "./provider/Layers/ProviderSessionReaper.ts";
 import { CheckpointDiffQueryLive } from "./checkpointing/Layers/CheckpointDiffQuery.ts";
 import { CheckpointStoreLive } from "./checkpointing/Layers/CheckpointStore.ts";
 import { GitCoreLive } from "./git/Layers/GitCore.ts";
@@ -223,7 +223,17 @@ const AuthLayerLive = ServerAuthLive.pipe(
   Layer.provide(ServerSecretStoreLive),
 );
 
-const ProviderRuntimeLayerLive = ProviderSessionReaperLive.pipe(
+const ProviderSessionReaperLayerLive = Layer.unwrap(
+  Effect.gen(function* () {
+    const config = yield* ServerConfig;
+    return makeProviderSessionReaperLive({
+      inactivityThresholdMs: config.providerSessionReaperInactivityThresholdMs,
+      fallbackReconcileIntervalMs: config.providerSessionReaperFallbackReconcileIntervalMs,
+    });
+  }),
+);
+
+const ProviderRuntimeLayerLive = ProviderSessionReaperLayerLive.pipe(
   Layer.provideMerge(ProviderLayerLive),
   Layer.provideMerge(ProviderSessionDirectoryEventsLayerLive),
   Layer.provideMerge(OrchestrationLayerLive),

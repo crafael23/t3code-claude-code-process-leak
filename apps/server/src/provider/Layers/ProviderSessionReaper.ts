@@ -1,16 +1,5 @@
 import type { ProviderKind } from "@t3tools/contracts";
-import {
-  Cause,
-  Clock,
-  Duration,
-  Effect,
-  Layer,
-  Metric,
-  Option,
-  Queue,
-  Schedule,
-  Stream,
-} from "effect";
+import { Cause, Clock, Duration, Effect, Layer, Metric, Option, Queue, Stream } from "effect";
 
 import {
   increment,
@@ -27,6 +16,8 @@ import { OrchestrationEngineService } from "../../orchestration/Services/Orchest
 import { ProviderSessionDirectory } from "../Services/ProviderSessionDirectory.ts";
 import { ProviderSessionDirectoryEvents } from "../Services/ProviderSessionDirectoryEvents.ts";
 import {
+  DEFAULT_PROVIDER_SESSION_REAPER_FALLBACK_RECONCILE_INTERVAL_MS,
+  DEFAULT_PROVIDER_SESSION_REAPER_INACTIVITY_THRESHOLD_MS,
   ProviderSessionReaper,
   type ProviderSessionReaperShape,
 } from "../Services/ProviderSessionReaper.ts";
@@ -34,17 +25,11 @@ import { ProviderService } from "../Services/ProviderService.ts";
 import type { InvalidAnchorEntry, ReapScheduleEntry } from "./reaperDeadlines.ts";
 import { deriveReapEntries } from "./reaperDeadlines.ts";
 
-const DEFAULT_INACTIVITY_THRESHOLD_MS = 30 * 60 * 1000;
-const DEFAULT_SWEEP_INTERVAL_MS = 5 * 60 * 1000;
-const DEFAULT_FALLBACK_RECONCILE_INTERVAL_MS = 30 * 60 * 1000;
-
-export type ProviderSessionReaperMode = "polling" | "deadline" | "deadline-shadow";
+const REAPER_MODE = "deadline";
 
 export interface ProviderSessionReaperLiveOptions {
   readonly inactivityThresholdMs?: number;
-  readonly sweepIntervalMs?: number;
   readonly fallbackReconcileIntervalMs?: number;
-  readonly mode?: ProviderSessionReaperMode;
 }
 
 type ReaperSignal =
@@ -67,6 +52,11 @@ interface ReconcileSnapshot {
 interface CoalescedWake {
   readonly signal: (signal: ReaperSignal) => Effect.Effect<void>;
   readonly await: Effect.Effect<ReaperSignal>;
+}
+
+interface SchedulerIterationResult {
+  readonly nextDeadlineAtMs: number | undefined;
+  readonly observedStartupWake: boolean;
 }
 
 function buildReaperLogContext(input: {
@@ -127,7 +117,7 @@ function buildInvalidAnchorLogContext(input: {
     inactivityAnchorAt: input.entry.inactivityAnchorAt,
     inactivityAnchorSource: input.entry.inactivityAnchorSource,
     inactivityAnchorMs: null,
-    sweepStartedAt: new Date(input.now).toISOString(),
+    reconciledAt: new Date(input.now).toISOString(),
     inactivityThresholdMs: input.inactivityThresholdMs,
     idleDurationMs: null,
     remainingUntilReapMs: null,
@@ -147,6 +137,20 @@ function wakeReason(signal: ReaperSignal | "timeout"): string {
   return `signal:${signal.type}`;
 }
 
+function wakeLogContext(signal: ReaperSignal | "timeout"): Record<string, unknown> {
+  if (signal === "timeout" || signal.type === "startup") {
+    return {};
+  }
+  if (signal.type === "reconcile-all") {
+    return {
+      reconcileReason: signal.reason,
+    };
+  }
+  return {
+    threadId: signal.threadId,
+  };
+}
+
 function providerBreakdown(
   entries: ReadonlyArray<ReapScheduleEntry>,
 ): Record<ProviderKind, number> {
@@ -162,7 +166,7 @@ function providerBreakdown(
   return counts;
 }
 
-const makeCoalescedWake = (mode: ProviderSessionReaperMode) =>
+const makeCoalescedWake = () =>
   Effect.gen(function* () {
     const queue = yield* Effect.acquireRelease(Queue.dropping<ReaperSignal>(1), Queue.shutdown);
 
@@ -170,7 +174,9 @@ const makeCoalescedWake = (mode: ProviderSessionReaperMode) =>
       signal: (signal) =>
         Queue.offer(queue, signal).pipe(
           Effect.flatMap((enqueued) =>
-            enqueued ? Effect.void : increment(providerSessionReaperWakeCoalescedTotal, { mode }),
+            enqueued
+              ? Effect.void
+              : increment(providerSessionReaperWakeCoalescedTotal, { mode: REAPER_MODE }),
           ),
         ),
       await: Queue.take(queue),
@@ -186,14 +192,14 @@ const makeProviderSessionReaper = (options?: ProviderSessionReaperLiveOptions) =
 
     const inactivityThresholdMs = Math.max(
       1,
-      options?.inactivityThresholdMs ?? DEFAULT_INACTIVITY_THRESHOLD_MS,
+      options?.inactivityThresholdMs ?? DEFAULT_PROVIDER_SESSION_REAPER_INACTIVITY_THRESHOLD_MS,
     );
-    const sweepIntervalMs = Math.max(1, options?.sweepIntervalMs ?? DEFAULT_SWEEP_INTERVAL_MS);
     const fallbackReconcileIntervalMs = Math.max(
       1,
-      options?.fallbackReconcileIntervalMs ?? DEFAULT_FALLBACK_RECONCILE_INTERVAL_MS,
+      options?.fallbackReconcileIntervalMs ??
+        DEFAULT_PROVIDER_SESSION_REAPER_FALLBACK_RECONCILE_INTERVAL_MS,
     );
-    const mode = options?.mode ?? "polling";
+    const mode = REAPER_MODE;
 
     const recordWake = (signal: ReaperSignal | "timeout", extra?: Record<string, unknown>) =>
       increment(providerSessionReaperWakeupsTotal, {
@@ -201,24 +207,21 @@ const makeProviderSessionReaper = (options?: ProviderSessionReaperLiveOptions) =
         reason: wakeReason(signal),
       }).pipe(
         Effect.andThen(
-          Effect.logDebug(
-            "provider.session.reaper.wake",
-            extra === undefined
-              ? {
-                  mode,
-                  reason: wakeReason(signal),
-                }
-              : {
-                  mode,
-                  reason: wakeReason(signal),
-                  ...extra,
-                },
-          ),
+          Effect.logDebug("provider.session.reaper.wake", {
+            mode,
+            reason: wakeReason(signal),
+            ...wakeLogContext(signal),
+            ...extra,
+          }),
         ),
       );
 
     const reconcileAuthoritativeState = () =>
       Effect.gen(function* () {
+        yield* Effect.annotateCurrentSpan({
+          "provider.session_reaper.mode": mode,
+          "provider.session_reaper.inactivity_threshold_ms": inactivityThresholdMs,
+        });
         const startedAtMs = yield* Clock.currentTimeMillis;
         yield* Effect.logDebug("provider.session.reaper.reconcile-started", {
           mode,
@@ -234,6 +237,15 @@ const makeProviderSessionReaper = (options?: ProviderSessionReaperLiveOptions) =
         });
         const reconciledAtMs = yield* Clock.currentTimeMillis;
         const reconcileDurationMs = Math.max(0, reconciledAtMs - startedAtMs);
+        yield* Effect.annotateCurrentSpan({
+          "provider.session_reaper.binding_count": bindings.length,
+          "provider.session_reaper.read_model_thread_count": readModel.threads.length,
+          "provider.session_reaper.schedule_size": derived.entries.length,
+          "provider.session_reaper.skipped_stopped_count": derived.skippedStopped,
+          "provider.session_reaper.skipped_active_turn_count": derived.skippedActiveTurn,
+          "provider.session_reaper.invalid_anchor_count": derived.invalidAnchors.length,
+          "provider.session_reaper.reconcile_duration_ms": reconcileDurationMs,
+        });
 
         yield* Metric.update(
           Metric.withAttributes(providerSessionReaperReconcileDuration, metricAttributes({ mode })),
@@ -271,13 +283,23 @@ const makeProviderSessionReaper = (options?: ProviderSessionReaperLiveOptions) =
           invalidAnchors: derived.invalidAnchors,
           reconciledAtMs,
         } satisfies ReconcileSnapshot;
-      });
+      }).pipe(
+        Effect.withSpan("provider.session.reaper.reconcile", {
+          attributes: {
+            "provider.session_reaper.mode": mode,
+          },
+        }),
+      );
 
     const stopDueEntries = (input: {
       readonly entries: ReadonlyArray<ReapScheduleEntry>;
       readonly nowMs: number;
     }) =>
       Effect.gen(function* () {
+        yield* Effect.annotateCurrentSpan({
+          "provider.session_reaper.mode": mode,
+          "provider.session_reaper.due_count": input.entries.length,
+        });
         yield* increment(
           providerSessionReaperDueCandidatesTotal,
           {
@@ -290,118 +312,111 @@ const makeProviderSessionReaper = (options?: ProviderSessionReaperLiveOptions) =
         let stopFailedCount = 0;
 
         for (const entry of input.entries) {
-          const logContext = buildReaperLogContext({
-            now: input.nowMs,
-            inactivityThresholdMs,
-            entry,
-          });
-
-          yield* Metric.update(
-            Metric.withAttributes(
-              providerSessionReaperReapLag,
-              metricAttributes({
-                mode,
-                provider: entry.provider,
-              }),
-            ),
-            Duration.millis(Math.max(0, input.nowMs - entry.deadlineAtMs)),
-          );
-
-          yield* Effect.logDebug("provider.session.reaper.reap-candidate", {
-            ...logContext,
-            decision: mode === "deadline-shadow" ? "would_stop_session" : "attempt_stop_session",
-          });
-
-          if (mode === "deadline-shadow") {
-            yield* Effect.logInfo("provider.session.reaper.shadow-candidate", {
-              ...logContext,
-              reason: "inactivity_threshold",
+          const reaped = yield* Effect.gen(function* () {
+            const logContext = buildReaperLogContext({
+              now: input.nowMs,
+              inactivityThresholdMs,
+              entry,
             });
-            continue;
-          }
 
-          const reaped = yield* providerService
-            .stopSession({
-              threadId: entry.threadId,
-            })
-            .pipe(
-              Effect.tap(() =>
-                Effect.logInfo("provider.session.reaped", {
-                  ...logContext,
-                  reason: "inactivity_threshold",
-                }).pipe(
-                  Effect.andThen(
-                    increment(providerSessionReaperReapedTotal, {
-                      mode,
-                      provider: entry.provider,
-                    }),
+            yield* Effect.annotateCurrentSpan({
+              "provider.session_reaper.mode": mode,
+              "provider.thread_id": entry.threadId,
+              "provider.kind": entry.provider,
+              "provider.session_reaper.deadline_basis_source": entry.deadlineBasisSource,
+              "provider.session_reaper.deadline_at_ms": entry.deadlineAtMs,
+              "provider.session_reaper.reap_lag_ms": logContext.reapLagMs,
+            });
+
+            yield* Metric.update(
+              Metric.withAttributes(
+                providerSessionReaperReapLag,
+                metricAttributes({
+                  mode,
+                  provider: entry.provider,
+                }),
+              ),
+              Duration.millis(Math.max(0, input.nowMs - entry.deadlineAtMs)),
+            );
+
+            yield* Effect.logDebug("provider.session.reaper.reap-candidate", {
+              ...logContext,
+              decision: "attempt_stop_session",
+            });
+
+            const reaped = yield* providerService
+              .stopSession({
+                threadId: entry.threadId,
+              })
+              .pipe(
+                Effect.tap(() =>
+                  Effect.logInfo("provider.session.reaped", {
+                    ...logContext,
+                    reason: "inactivity_threshold",
+                  }).pipe(
+                    Effect.andThen(
+                      increment(providerSessionReaperReapedTotal, {
+                        mode,
+                        provider: entry.provider,
+                      }),
+                    ),
                   ),
                 ),
-              ),
-              Effect.as(true),
-              Effect.catchCause((cause) => {
-                if (Cause.hasInterruptsOnly(cause)) {
-                  return Effect.failCause(cause);
-                }
-                stopFailedCount += 1;
-                return Effect.logWarning("provider.session.reaper.stop-failed", {
-                  ...logContext,
-                  reason: "inactivity_threshold",
-                  cause,
-                }).pipe(Effect.as(false));
-              }),
-            );
+                Effect.as(true),
+                Effect.catchCause((cause) => {
+                  if (Cause.hasInterruptsOnly(cause)) {
+                    return Effect.failCause(cause);
+                  }
+                  stopFailedCount += 1;
+                  return Effect.logWarning("provider.session.reaper.stop-failed", {
+                    ...logContext,
+                    reason: "inactivity_threshold",
+                    cause,
+                  }).pipe(Effect.as(false));
+                }),
+              );
+
+            yield* Effect.annotateCurrentSpan({
+              "provider.session_reaper.stop_outcome": reaped ? "reaped" : "failed",
+            });
+            return reaped;
+          }).pipe(
+            Effect.withSpan("provider.session.reaper.stop_session", {
+              kind: "client",
+              attributes: {
+                "provider.session_reaper.mode": mode,
+                "provider.thread_id": entry.threadId,
+                "provider.kind": entry.provider,
+                "provider.session_reaper.deadline_basis_source": entry.deadlineBasisSource,
+              },
+            }),
+          );
 
           if (reaped) {
             reapedCount += 1;
           }
         }
 
+        yield* Effect.annotateCurrentSpan({
+          "provider.session_reaper.reaped_count": reapedCount,
+          "provider.session_reaper.stop_failed_count": stopFailedCount,
+        });
+
         return {
           reapedCount,
           stopFailedCount,
         } as const;
-      });
-
-    const runPollingSweep = Effect.gen(function* () {
-      const snapshot = yield* reconcileAuthoritativeState();
-      const now = snapshot.reconciledAtMs;
-      const dueEntries = snapshot.entries.filter((entry) => entry.deadlineAtMs <= now);
-      const futureEntries = snapshot.entries.filter((entry) => entry.deadlineAtMs > now);
-      const stopResult = yield* stopDueEntries({
-        entries: dueEntries,
-        nowMs: now,
-      });
-
-      yield* Metric.update(
-        Metric.withAttributes(providerSessionReaperScheduleSize, metricAttributes({ mode })),
-        futureEntries.length,
+      }).pipe(
+        Effect.withSpan("provider.session.reaper.stop_due", {
+          attributes: {
+            "provider.session_reaper.mode": mode,
+            "provider.session_reaper.due_count": input.entries.length,
+          },
+        }),
       );
 
-      yield* Effect.logDebug("provider.session.reaper.sweep-complete", {
-        mode,
-        bindingCount: snapshot.bindingCount,
-        reapedCount: stopResult.reapedCount,
-        skippedStoppedCount: snapshot.skippedStopped,
-        skippedActiveTurnCount: snapshot.skippedActiveTurn,
-        skippedWithinThresholdCount: futureEntries.length,
-        invalidAnchorCount: snapshot.invalidAnchors.length,
-        stopFailedCount: stopResult.stopFailedCount,
-        inactivityThresholdMs,
-        sweepStartedAt: new Date(now).toISOString(),
-      });
-
-      if (stopResult.reapedCount > 0) {
-        yield* Effect.logInfo("provider.session.reaper.sweep-complete", {
-          mode,
-          reapedCount: stopResult.reapedCount,
-          totalBindings: snapshot.bindingCount,
-        });
-      }
-    });
-
     const runDeadlineScheduler = Effect.gen(function* () {
-      const wake = yield* makeCoalescedWake(mode);
+      const wake = yield* makeCoalescedWake();
 
       const signalWake = (signal: ReaperSignal) => wake.signal(signal);
 
@@ -466,120 +481,179 @@ const makeProviderSessionReaper = (options?: ProviderSessionReaperLiveOptions) =
       let observedStartupWake = false;
 
       while (true) {
-        if (nextDeadlineAtMs === undefined) {
-          const signal = yield* wake.await;
-          observedStartupWake ||= signal.type === "startup";
-          yield* recordWake(signal);
-        } else {
-          const waitMs = Math.max(0, nextDeadlineAtMs - (yield* Clock.currentTimeMillis));
-          const signal = yield* wake.await.pipe(Effect.timeoutOption(Duration.millis(waitMs)));
-          if (Option.isSome(signal)) {
-            observedStartupWake ||= signal.value.type === "startup";
-            yield* recordWake(signal.value, {
-              deadlineAt: new Date(nextDeadlineAtMs).toISOString(),
-              waitMs,
-            });
+        const iterationResult: SchedulerIterationResult = yield* Effect.gen(function* () {
+          yield* Effect.annotateCurrentSpan({
+            "provider.session_reaper.mode": mode,
+            ...(nextDeadlineAtMs !== undefined
+              ? {
+                  "provider.session_reaper.next_deadline_at_ms": nextDeadlineAtMs,
+                  "provider.session_reaper.next_deadline_at": new Date(
+                    nextDeadlineAtMs,
+                  ).toISOString(),
+                }
+              : {}),
+          });
+
+          let wakeSignal: ReaperSignal | "timeout";
+          if (nextDeadlineAtMs === undefined) {
+            const signal = yield* wake.await;
+            observedStartupWake ||= signal.type === "startup";
+            wakeSignal = signal;
+            yield* recordWake(signal);
           } else {
-            yield* recordWake("timeout", {
-              deadlineAt: new Date(nextDeadlineAtMs).toISOString(),
-              waitMs,
+            const waitMs = Math.max(0, nextDeadlineAtMs - (yield* Clock.currentTimeMillis));
+            const signal = yield* wake.await.pipe(Effect.timeoutOption(Duration.millis(waitMs)));
+            if (Option.isSome(signal)) {
+              observedStartupWake ||= signal.value.type === "startup";
+              wakeSignal = signal.value;
+              yield* recordWake(signal.value, {
+                deadlineAt: new Date(nextDeadlineAtMs).toISOString(),
+                waitMs,
+              });
+            } else {
+              wakeSignal = "timeout";
+              yield* recordWake("timeout", {
+                deadlineAt: new Date(nextDeadlineAtMs).toISOString(),
+                waitMs,
+              });
+            }
+          }
+
+          yield* Effect.annotateCurrentSpan({
+            "provider.session_reaper.wake_reason": wakeReason(wakeSignal),
+            ...(wakeSignal !== "timeout" && "threadId" in wakeSignal
+              ? { "provider.thread_id": wakeSignal.threadId }
+              : {}),
+            ...(wakeSignal !== "timeout" && wakeSignal.type === "reconcile-all"
+              ? { "provider.session_reaper.reconcile_reason": wakeSignal.reason }
+              : {}),
+          });
+
+          const snapshotOption = yield* reconcileAuthoritativeState().pipe(
+            Effect.map(Option.some),
+            Effect.catchCause((cause) => {
+              if (Cause.hasInterruptsOnly(cause)) {
+                return Effect.failCause(cause);
+              }
+              return Effect.logWarning("provider.session.reaper.reconcile-failed", {
+                mode,
+                cause,
+              }).pipe(Effect.as(Option.none<ReconcileSnapshot>()));
+            }),
+          );
+
+          if (Option.isNone(snapshotOption)) {
+            yield* Effect.annotateCurrentSpan({
+              "provider.session_reaper.reconcile_outcome": "failed",
+            });
+            return {
+              nextDeadlineAtMs: undefined,
+              observedStartupWake,
+            };
+          }
+
+          const snapshot = snapshotOption.value;
+          const now = snapshot.reconciledAtMs;
+          const dueEntries = snapshot.entries.filter((entry) => entry.deadlineAtMs <= now);
+          const futureEntries = snapshot.entries.filter((entry) => entry.deadlineAtMs > now);
+
+          yield* Metric.update(
+            Metric.withAttributes(providerSessionReaperScheduleSize, metricAttributes({ mode })),
+            futureEntries.length,
+          );
+
+          yield* Effect.annotateCurrentSpan({
+            "provider.session_reaper.reconcile_outcome": "success",
+            "provider.session_reaper.schedule_size": futureEntries.length,
+            "provider.session_reaper.due_count": dueEntries.length,
+            "provider.session_reaper.skipped_stopped_count": snapshot.skippedStopped,
+            "provider.session_reaper.skipped_active_turn_count": snapshot.skippedActiveTurn,
+            "provider.session_reaper.invalid_anchor_count": snapshot.invalidAnchors.length,
+          });
+
+          if (observedStartupWake && dueEntries.length > 0) {
+            observedStartupWake = false;
+            yield* Effect.logInfo("provider.session.reaper.overdue-on-startup", {
+              mode,
+              overdueCount: dueEntries.length,
+              providers: providerBreakdown(dueEntries),
             });
           }
-        }
 
-        const snapshotOption = yield* reconcileAuthoritativeState().pipe(
-          Effect.map(Option.some),
-          Effect.catchCause((cause) => {
-            if (Cause.hasInterruptsOnly(cause)) {
-              return Effect.failCause(cause);
+          if (dueEntries.length > 0) {
+            const stopResult = yield* stopDueEntries({
+              entries: dueEntries,
+              nowMs: now,
+            });
+            yield* Effect.annotateCurrentSpan({
+              "provider.session_reaper.reaped_count": stopResult.reapedCount,
+              "provider.session_reaper.stop_failed_count": stopResult.stopFailedCount,
+            });
+            if (stopResult.reapedCount > 0 && futureEntries.length > 0) {
+              yield* signalWake({ type: "reconcile-all", reason: "post-stop" });
             }
-            return Effect.logWarning("provider.session.reaper.reconcile-failed", {
-              mode,
-              cause,
-            }).pipe(Effect.as(Option.none<ReconcileSnapshot>()));
-          }),
-        );
+            return {
+              nextDeadlineAtMs: undefined,
+              observedStartupWake: false,
+            };
+          }
 
-        if (Option.isNone(snapshotOption)) {
-          nextDeadlineAtMs = undefined;
-          continue;
-        }
+          const nextEntry = futureEntries[0];
+          if (nextEntry === undefined) {
+            return {
+              nextDeadlineAtMs: undefined,
+              observedStartupWake: false,
+            };
+          }
 
-        const snapshot = snapshotOption.value;
-        const now = snapshot.reconciledAtMs;
-        const dueEntries = snapshot.entries.filter((entry) => entry.deadlineAtMs <= now);
-        const futureEntries = snapshot.entries.filter((entry) => entry.deadlineAtMs > now);
-
-        yield* Metric.update(
-          Metric.withAttributes(providerSessionReaperScheduleSize, metricAttributes({ mode })),
-          futureEntries.length,
-        );
-
-        if (observedStartupWake && dueEntries.length > 0) {
-          observedStartupWake = false;
-          yield* Effect.logInfo("provider.session.reaper.overdue-on-startup", {
+          yield* Effect.logDebug("provider.session.reaper.next-deadline-selected", {
+            ...buildReaperLogContext({
+              now,
+              inactivityThresholdMs,
+              entry: nextEntry,
+            }),
             mode,
-            overdueCount: dueEntries.length,
-            providers: providerBreakdown(dueEntries),
+            waitMs: Math.max(0, nextEntry.deadlineAtMs - now),
           });
-        }
 
-        if (dueEntries.length > 0) {
-          yield* stopDueEntries({
-            entries: dueEntries,
-            nowMs: now,
-          });
-          nextDeadlineAtMs = undefined;
-          continue;
-        }
-
-        observedStartupWake = false;
-        const nextEntry = futureEntries[0];
-        if (nextEntry === undefined) {
-          nextDeadlineAtMs = undefined;
-          continue;
-        }
-
-        nextDeadlineAtMs = nextEntry.deadlineAtMs;
-        yield* Effect.logDebug("provider.session.reaper.next-deadline-selected", {
-          ...buildReaperLogContext({
-            now,
-            inactivityThresholdMs,
-            entry: nextEntry,
+          return {
+            nextDeadlineAtMs: nextEntry.deadlineAtMs,
+            observedStartupWake: false,
+          };
+        }).pipe(
+          Effect.withSpan("provider.session.reaper.iteration", {
+            attributes: {
+              "provider.session_reaper.mode": mode,
+              ...(nextDeadlineAtMs !== undefined
+                ? { "provider.session_reaper.next_deadline_at_ms": nextDeadlineAtMs }
+                : {}),
+            },
           }),
-          mode,
-          waitMs: Math.max(0, nextEntry.deadlineAtMs - now),
-        });
+        );
+
+        nextDeadlineAtMs = iterationResult.nextDeadlineAtMs;
+        observedStartupWake = iterationResult.observedStartupWake;
       }
     });
 
     const start: ProviderSessionReaperShape["start"] = () =>
       Effect.gen(function* () {
-        const worker =
-          mode === "polling"
-            ? runPollingSweep.pipe(
-                Effect.catchCause((cause) => {
-                  if (Cause.hasInterruptsOnly(cause)) {
-                    return Effect.failCause(cause);
-                  }
-                  return Effect.logWarning("provider.session.reaper.sweep-failed", {
-                    mode,
-                    cause,
-                  });
-                }),
-                Effect.repeat(Schedule.spaced(Duration.millis(sweepIntervalMs))),
-              )
-            : runDeadlineScheduler;
-
-        yield* Effect.forkScoped(worker);
+        yield* Effect.forkScoped(runDeadlineScheduler);
 
         yield* Effect.logInfo("provider.session.reaper.scheduler-started", {
           mode,
           inactivityThresholdMs,
-          sweepIntervalMs,
           fallbackReconcileIntervalMs,
         });
-      });
+      }).pipe(
+        Effect.withSpan("provider.session.reaper.start", {
+          attributes: {
+            "provider.session_reaper.mode": mode,
+            "provider.session_reaper.inactivity_threshold_ms": inactivityThresholdMs,
+            "provider.session_reaper.fallback_reconcile_interval_ms": fallbackReconcileIntervalMs,
+          },
+        }),
+      );
 
     return {
       start,

@@ -181,7 +181,6 @@ describe("ProviderSessionReaper", () => {
     const layer = makeProviderSessionReaperLive({
       inactivityThresholdMs: 1_000,
       fallbackReconcileIntervalMs: 60_000,
-      mode: "deadline",
     }).pipe(
       Layer.provideMerge(providerSessionDirectoryLayer),
       Layer.provideMerge(directoryEventsLayer),

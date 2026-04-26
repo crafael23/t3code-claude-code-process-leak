@@ -1,6 +1,9 @@
 import { Context } from "effect";
 import type { Effect, Scope } from "effect";
 
+export const DEFAULT_PROVIDER_SESSION_REAPER_INACTIVITY_THRESHOLD_MS = 30 * 60 * 1000;
+export const DEFAULT_PROVIDER_SESSION_REAPER_FALLBACK_RECONCILE_INTERVAL_MS = 30 * 60 * 1000;
+
 export interface ProviderSessionReaperShape {
   /**
    * Start the background provider session reaper within the provided scope.

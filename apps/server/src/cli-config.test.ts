@@ -7,6 +7,10 @@ import { NetService } from "@t3tools/shared/Net";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { deriveServerPaths } from "./config.ts";
 import { resolveServerConfig } from "./cli.ts";
+import {
+  DEFAULT_PROVIDER_SESSION_REAPER_FALLBACK_RECONCILE_INTERVAL_MS,
+  DEFAULT_PROVIDER_SESSION_REAPER_INACTIVITY_THRESHOLD_MS,
+} from "./provider/Services/ProviderSessionReaper.ts";
 
 it.layer(NodeServices.layer)("cli config resolution", (it) => {
   const defaultObservabilityConfig = {
@@ -19,6 +23,10 @@ it.layer(NodeServices.layer)("cli config resolution", (it) => {
     otlpMetricsUrl: undefined,
     otlpExportIntervalMs: 10_000,
     otlpServiceName: "t3-server",
+    providerSessionReaperInactivityThresholdMs:
+      DEFAULT_PROVIDER_SESSION_REAPER_INACTIVITY_THRESHOLD_MS,
+    providerSessionReaperFallbackReconcileIntervalMs:
+      DEFAULT_PROVIDER_SESSION_REAPER_FALLBACK_RECONCILE_INTERVAL_MS,
   } as const;
 
   const openBootstrapFd = Effect.fn(function* (payload: Record<string, unknown>) {
@@ -87,6 +95,63 @@ it.layer(NodeServices.layer)("cli config resolution", (it) => {
         desktopBootstrapToken: undefined,
         autoBootstrapProjectFromCwd: false,
         logWebSocketEvents: true,
+      });
+    }),
+  );
+
+  it.effect("reads provider session reaper tuning env vars", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const baseDir = yield* fs.makeTempDirectoryScoped({ prefix: "t3-cli-config-reaper-" });
+      const derivedPaths = yield* deriveServerPaths(baseDir, undefined);
+      const resolved = yield* resolveServerConfig(
+        {
+          mode: Option.some("desktop"),
+          port: Option.some(4888),
+          host: Option.none(),
+          baseDir: Option.some(baseDir),
+          cwd: Option.none(),
+          devUrl: Option.none(),
+          noBrowser: Option.none(),
+          bootstrapFd: Option.none(),
+          autoBootstrapProjectFromCwd: Option.none(),
+          logWebSocketEvents: Option.none(),
+        },
+        Option.none(),
+      ).pipe(
+        Effect.provide(
+          Layer.mergeAll(
+            ConfigProvider.layer(
+              ConfigProvider.fromEnv({
+                env: {
+                  T3CODE_PROVIDER_SESSION_REAPER_INACTIVITY_THRESHOLD_MS: "1500",
+                  T3CODE_PROVIDER_SESSION_REAPER_FALLBACK_RECONCILE_INTERVAL_MS: "2500",
+                },
+              }),
+            ),
+            NetService.layer,
+          ),
+        ),
+      );
+
+      expect(resolved).toEqual({
+        logLevel: "Info",
+        ...defaultObservabilityConfig,
+        providerSessionReaperInactivityThresholdMs: 1500,
+        providerSessionReaperFallbackReconcileIntervalMs: 2500,
+        mode: "desktop",
+        port: 4888,
+        cwd: process.cwd(),
+        baseDir,
+        ...derivedPaths,
+        host: "127.0.0.1",
+        staticDir: resolved.staticDir,
+        devUrl: undefined,
+        noBrowser: true,
+        startupPresentation: "browser",
+        desktopBootstrapToken: undefined,
+        autoBootstrapProjectFromCwd: false,
+        logWebSocketEvents: false,
       });
     }),
   );

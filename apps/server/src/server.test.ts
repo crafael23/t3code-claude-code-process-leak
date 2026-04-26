@@ -354,6 +354,8 @@ const buildAppUnderTest = (options?: {
       otlpMetricsUrl: undefined,
       otlpExportIntervalMs: 10_000,
       otlpServiceName: "t3-server",
+      providerSessionReaperInactivityThresholdMs: 30 * 60 * 1000,
+      providerSessionReaperFallbackReconcileIntervalMs: 30 * 60 * 1000,
       mode: "desktop",
       port: 0,
       host: "127.0.0.1",
