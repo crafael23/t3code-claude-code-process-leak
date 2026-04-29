@@ -1,5 +1,5 @@
 import { ProviderKind, type ThreadId } from "@t3tools/contracts";
-import { Effect, Layer, Option, Schema } from "effect";
+import { Cause, Effect, Layer, Option, Schema } from "effect";
 
 import type { ProviderSessionRuntime } from "../../persistence/Services/ProviderSessionRuntime.ts";
 import { ProviderSessionRuntimeRepository } from "../../persistence/Services/ProviderSessionRuntime.ts";
@@ -131,12 +131,15 @@ const makeProviderSessionDirectory = Effect.gen(function* () {
       })
       .pipe(Effect.mapError(toPersistenceError("ProviderSessionDirectory.upsert:upsert")));
     yield* directoryEvents.publishChanged(resolvedThreadId).pipe(
-      Effect.catchCause((cause) =>
-        Effect.logDebug("provider.session.directory.change-signal-failed", {
+      Effect.catchCause((cause) => {
+        if (Cause.hasInterruptsOnly(cause)) {
+          return Effect.failCause(cause);
+        }
+        return Effect.logDebug("provider.session.directory.change-signal-failed", {
           threadId: resolvedThreadId,
           cause,
-        }),
-      ),
+        });
+      }),
     );
   });
 

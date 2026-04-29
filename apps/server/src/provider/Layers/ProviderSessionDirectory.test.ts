@@ -6,7 +6,7 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import { ThreadId } from "@t3tools/contracts";
 import { it, assert } from "@effect/vitest";
 import { assertSome } from "@effect/vitest/utils";
-import { Effect, Fiber, Layer, Option, Stream } from "effect";
+import { Cause, Effect, Exit, Fiber, Layer, Option, Stream } from "effect";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 
 import {
@@ -330,6 +330,42 @@ it.layer(makeDirectoryLayer(SqlitePersistenceMemory))("ProviderSessionDirectoryL
       if (Option.isSome(runtime)) {
         assert.equal(runtime.value.threadId, threadId);
         assert.equal(runtime.value.providerName, "codex");
+      }
+    }));
+
+  it("preserves interruption when change notification publishing is interrupted", () =>
+    Effect.gen(function* () {
+      const runtimeRepositoryLayer = ProviderSessionRuntimeRepositoryLive.pipe(
+        Layer.provide(SqlitePersistenceMemory),
+      );
+      const interruptedDirectoryEventsLayer = Layer.succeed(ProviderSessionDirectoryEvents, {
+        publishChanged: () => Effect.interrupt,
+        changes: Stream.empty,
+      });
+      const directoryLayer = Layer.mergeAll(
+        runtimeRepositoryLayer,
+        interruptedDirectoryEventsLayer,
+        ProviderSessionDirectoryLive.pipe(
+          Layer.provide(runtimeRepositoryLayer),
+          Layer.provide(interruptedDirectoryEventsLayer),
+        ),
+        NodeServices.layer,
+      );
+
+      const exit = yield* Effect.exit(
+        Effect.gen(function* () {
+          const directory = yield* ProviderSessionDirectory;
+          yield* directory.upsert({
+            provider: "codex",
+            threadId: ThreadId.make("thread-interrupted-directory-events"),
+            status: "running",
+          });
+        }).pipe(Effect.provide(directoryLayer)),
+      );
+
+      assert.equal(Exit.isFailure(exit), true);
+      if (Exit.isFailure(exit)) {
+        assert.equal(Cause.hasInterruptsOnly(exit.cause), true);
       }
     }));
 });

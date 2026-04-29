@@ -24,7 +24,3 @@ export const ProviderSessionDirectoryEventsLive = Layer.effect(
   ProviderSessionDirectoryEvents,
   makeProviderSessionDirectoryEvents,
 );
-
-export function makeProviderSessionDirectoryEventsLive() {
-  return Layer.effect(ProviderSessionDirectoryEvents, makeProviderSessionDirectoryEvents);
-}
