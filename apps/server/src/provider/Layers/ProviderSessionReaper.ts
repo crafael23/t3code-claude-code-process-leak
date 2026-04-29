@@ -1,5 +1,18 @@
 import type { ProviderKind } from "@t3tools/contracts";
-import { Cause, Clock, Duration, Effect, Layer, Metric, Option, Queue, Stream } from "effect";
+import {
+  Cause,
+  Clock,
+  Context,
+  Duration,
+  Effect,
+  Layer,
+  Metric,
+  Option,
+  Queue,
+  Scope,
+  Stream,
+  Tracer,
+} from "effect";
 
 import {
   increment,
@@ -9,6 +22,7 @@ import {
   providerSessionReaperReapedTotal,
   providerSessionReaperReconcileDuration,
   providerSessionReaperScheduleSize,
+  providerSessionReaperSignalFeedRestartsTotal,
   providerSessionReaperWakeCoalescedTotal,
   providerSessionReaperWakeupsTotal,
 } from "../../observability/Metrics.ts";
@@ -426,9 +440,9 @@ const makeProviderSessionReaper = (options?: ProviderSessionReaperLiveOptions) =
         } as const;
       }).pipe(
         Effect.withSpan("provider.session.reaper.stop_due", {
+          kind: "internal",
           attributes: {
             "provider.session_reaper.mode": mode,
-            "provider.session_reaper.due_count": input.entries.length,
           },
         }),
       );
@@ -444,11 +458,17 @@ const makeProviderSessionReaper = (options?: ProviderSessionReaperLiveOptions) =
             if (Cause.hasInterruptsOnly(cause)) {
               return Effect.failCause(cause);
             }
-            return Effect.logWarning("provider.session.reaper.signal-stream-failed", {
+            return increment(providerSessionReaperSignalFeedRestartsTotal, {
               mode,
               feed: name,
-              cause,
             }).pipe(
+              Effect.andThen(
+                Effect.logWarning("provider.session.reaper.signal-stream-failed", {
+                  mode,
+                  feed: name,
+                  cause,
+                }),
+              ),
               Effect.andThen(signalWake({ type: "reconcile-all", reason: `feed-failed:${name}` })),
             );
           }),
@@ -670,11 +690,10 @@ const makeProviderSessionReaper = (options?: ProviderSessionReaperLiveOptions) =
           };
         }).pipe(
           Effect.withSpan("provider.session.reaper.iteration", {
+            kind: "internal",
+            root: true,
             attributes: {
               "provider.session_reaper.mode": mode,
-              ...(nextDeadlineAtMs !== undefined
-                ? { "provider.session_reaper.next_deadline_at_ms": nextDeadlineAtMs }
-                : {}),
             },
           }),
         );
@@ -686,7 +705,13 @@ const makeProviderSessionReaper = (options?: ProviderSessionReaperLiveOptions) =
 
     const start: ProviderSessionReaperShape["start"] = () =>
       Effect.gen(function* () {
-        yield* Effect.forkScoped(runDeadlineScheduler);
+        yield* Effect.forkScoped(
+          runDeadlineScheduler.pipe(
+            Effect.updateContext((context: Context.Context<Scope.Scope>) =>
+              Context.omit(Tracer.ParentSpan)(context),
+            ),
+          ),
+        );
 
         yield* Effect.logInfo("provider.session.reaper.scheduler-started", {
           mode,
@@ -696,6 +721,8 @@ const makeProviderSessionReaper = (options?: ProviderSessionReaperLiveOptions) =
         });
       }).pipe(
         Effect.withSpan("provider.session.reaper.start", {
+          kind: "internal",
+          root: true,
           attributes: {
             "provider.session_reaper.mode": mode,
             "provider.session_reaper.inactivity_threshold_ms": inactivityThresholdMs,

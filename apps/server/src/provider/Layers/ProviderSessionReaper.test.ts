@@ -6,9 +6,25 @@ import {
   TurnId,
   type OrchestrationEvent,
 } from "@t3tools/contracts";
-import { Effect, Exit, Layer, ManagedRuntime, Option, PubSub, Scope, Stream } from "effect";
+import {
+  Effect,
+  Exit,
+  Layer,
+  Logger,
+  ManagedRuntime,
+  Metric,
+  Option,
+  PubSub,
+  References,
+  Scope,
+  Stream,
+  Tracer,
+} from "effect";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+import { makeLocalFileTracer } from "../../observability/LocalFileTracer.ts";
+import type { EffectTraceRecord } from "../../observability/TraceRecord.ts";
+import type { TraceSink } from "../../observability/TraceSink.ts";
 import {
   OrchestrationEngineService,
   type OrchestrationEngineShape,
@@ -27,6 +43,46 @@ const defaultModelSelection = {
   provider: "codex",
   model: "gpt-5-codex",
 } as const;
+
+const hasMetricSnapshot = (
+  snapshots: ReadonlyArray<Metric.Metric.Snapshot>,
+  id: string,
+  attributes: Readonly<Record<string, string>>,
+) =>
+  snapshots.some(
+    (snapshot) =>
+      snapshot.id === id &&
+      Object.entries(attributes).every(([key, value]) => snapshot.attributes?.[key] === value),
+  );
+
+const makeTraceTestLayer = (records: Array<EffectTraceRecord>) => {
+  const sink = {
+    filePath: "provider-session-reaper-test",
+    push(record) {
+      if (record.type === "effect-span") {
+        records.push(record);
+      }
+    },
+    flush: Effect.void,
+    close: () => Effect.void,
+  } satisfies TraceSink;
+
+  return Layer.mergeAll(
+    Layer.effect(
+      Tracer.Tracer,
+      makeLocalFileTracer({
+        filePath: sink.filePath,
+        maxBytes: 1024 * 1024,
+        maxFiles: 1,
+        batchWindowMs: 10_000,
+        sink,
+      }),
+    ),
+    Logger.layer([Logger.tracerLogger], { mergeWithExisting: false }),
+    Layer.succeed(References.MinimumLogLevel, "Info"),
+    Layer.succeed(References.TracerTimingEnabled, true),
+  );
+};
 
 async function waitFor(
   predicate: () => boolean | Promise<boolean>,
@@ -132,6 +188,8 @@ describe("ProviderSessionReaper", () => {
 
   async function createHarness(input: {
     readonly readModel: ReturnType<typeof makeReadModel>;
+    readonly streamDomainEvents?: Stream.Stream<OrchestrationEvent>;
+    readonly traceRecords?: Array<EffectTraceRecord>;
     readonly stopSessionImplementation?: (input: {
       readonly threadId: ThreadId;
     }) => ReturnType<ProviderServiceShape["stopSession"]>;
@@ -166,7 +224,7 @@ describe("ProviderSessionReaper", () => {
       readEvents: () => Stream.empty,
       dispatch: () => unsupported(),
       get streamDomainEvents() {
-        return Stream.fromPubSub(domainEventPubSub);
+        return input.streamDomainEvents ?? Stream.fromPubSub(domainEventPubSub);
       },
     };
 
@@ -178,7 +236,7 @@ describe("ProviderSessionReaper", () => {
       Layer.provide(runtimeRepositoryLayer),
       Layer.provide(directoryEventsLayer),
     );
-    const layer = makeProviderSessionReaperLive({
+    const baseLayer = makeProviderSessionReaperLive({
       inactivityThresholdMs: 1_000,
       fallbackReconcileIntervalMs: 60_000,
     }).pipe(
@@ -189,6 +247,10 @@ describe("ProviderSessionReaper", () => {
       Layer.provideMerge(Layer.succeed(OrchestrationEngineService, orchestrationEngine)),
       Layer.provideMerge(NodeServices.layer),
     );
+    const layer =
+      input.traceRecords === undefined
+        ? baseLayer
+        : baseLayer.pipe(Layer.provideMerge(makeTraceTestLayer(input.traceRecords)));
 
     runtime = ManagedRuntime.make(layer);
     return {
@@ -196,6 +258,72 @@ describe("ProviderSessionReaper", () => {
       stoppedThreadIds,
     };
   }
+
+  it("emits root start and iteration spans without signal feed spans", async () => {
+    const traceRecords: Array<EffectTraceRecord> = [];
+    await createHarness({
+      readModel: makeReadModel([]),
+      traceRecords,
+    });
+
+    const reaper = await runtime!.runPromise(Effect.service(ProviderSessionReaper));
+    scope = await Effect.runPromise(Scope.make("sequential"));
+    await runtime!.runPromise(
+      reaper.start().pipe(Scope.provide(scope), Effect.withSpan("test.parent")),
+    );
+
+    await waitFor(() =>
+      traceRecords.some((record) => record.name === "provider.session.reaper.iteration"),
+    );
+
+    await Effect.runPromise(Scope.close(scope, Exit.void));
+    scope = null;
+
+    const start = traceRecords.find((record) => record.name === "provider.session.reaper.start");
+    const iteration = traceRecords.find(
+      (record) => record.name === "provider.session.reaper.iteration",
+    );
+    const reconcile = traceRecords.find(
+      (record) => record.name === "provider.session.reaper.reconcile",
+    );
+
+    expect(start).toBeDefined();
+    expect(start?.parentSpanId).toBeUndefined();
+    expect(iteration).toBeDefined();
+    expect(iteration?.parentSpanId).toBeUndefined();
+    expect(reconcile?.parentSpanId).toBe(iteration?.spanId);
+    expect(
+      traceRecords.some((record) => record.name === "provider.session.reaper.signal_feed"),
+    ).toBe(false);
+  });
+
+  it("records signal feed restart metrics without signal feed spans", async () => {
+    const traceRecords: Array<EffectTraceRecord> = [];
+    await createHarness({
+      readModel: makeReadModel([]),
+      streamDomainEvents: Stream.die(new Error("simulated orchestration stream failure")),
+      traceRecords,
+    });
+
+    const reaper = await runtime!.runPromise(Effect.service(ProviderSessionReaper));
+    scope = await Effect.runPromise(Scope.make("sequential"));
+    await runtime!.runPromise(reaper.start().pipe(Scope.provide(scope)));
+
+    await waitFor(async () => {
+      const snapshots = await runtime!.runPromise(Metric.snapshot);
+      return hasMetricSnapshot(snapshots, "t3_provider_session_reaper_signal_feed_restarts_total", {
+        mode: "deadline",
+        feed: "orchestration-domain-events",
+      });
+    });
+
+    await Effect.runPromise(Scope.close(scope, Exit.void));
+    scope = null;
+
+    expect(
+      traceRecords.some((record) => record.name === "provider.session.reaper.signal_feed"),
+    ).toBe(false);
+  });
 
   it("reaps stale persisted sessions without active turns", async () => {
     const threadId = ThreadId.make("thread-reaper-stale");

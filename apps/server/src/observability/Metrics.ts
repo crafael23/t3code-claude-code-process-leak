@@ -101,6 +101,14 @@ export const providerSessionReaperWakeCoalescedTotal = Metric.counter(
   },
 );
 
+export const providerSessionReaperSignalFeedRestartsTotal = Metric.counter(
+  "t3_provider_session_reaper_signal_feed_restarts_total",
+  {
+    description:
+      "Total provider session reaper signal feeds that failed and triggered recovery reconciliation.",
+  },
+);
+
 export const gitCommandsTotal = Metric.counter("t3_git_commands_total", {
   description: "Total git commands executed by the server runtime.",
 });
